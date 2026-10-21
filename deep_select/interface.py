@@ -1,4 +1,5 @@
 import functools
+import glob
 import importlib
 import os
 
@@ -10,9 +11,12 @@ from typing import Optional, Tuple
 _IS_ASCEND = os.path.exists("/dev/davinci_manager")
 # MUSA keeps torch.cuda.is_available() False on purpose, so probe the version field
 # and the device nodes rather than the CUDA API.
+# Device nodes are named /dev/mtgpu.0 (with a dot) on S5000, so match by glob.
 _IS_MUSA = (
-    hasattr(torch.version, "musa") and torch.version.musa is not None
-) or os.path.exists("/dev/mtgpu0")
+    (hasattr(torch.version, "musa") and torch.version.musa is not None)
+    or bool(glob.glob("/dev/mtgpu*"))
+    or bool(glob.glob("/dev/musa*"))
+)
 
 def _import_backend():
     if _IS_ASCEND:

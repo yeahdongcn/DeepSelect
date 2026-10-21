@@ -26,10 +26,12 @@ def get_alignment_requirement():
     """Stride requirements in bytes for (input, output).
 
     The compiled backends require an alignment so their vectorised loads are valid.
-    ``torch.topk`` has no such constraint, and returning 1 keeps the caller's
-    allocation path simple (the rounded stride equals ``topk`` itself).
+    ``torch.topk`` has no such constraint, but the caller divides this by the element
+    size to round the output stride, so it has to be a real byte count: the documented
+    contract is 32 Bytes, and anything smaller yields a zero row stride for dtypes
+    wider than one byte.
     """
-    return (1, 1)
+    return (32, 32)
 
 
 def _gather_keep_order(values: torch.Tensor, order: torch.Tensor) -> torch.Tensor:

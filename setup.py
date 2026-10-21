@@ -1,3 +1,4 @@
+import glob
 import os
 import subprocess
 from datetime import datetime
@@ -5,7 +6,30 @@ from pathlib import Path
 
 from setuptools import setup, find_packages
 
-import tests.kernelkit as kk
+# MUSA keeps torch.cuda.is_available() false on purpose, so probe the device node. This has to
+# happen before importing kernelkit, which shells out to `lspci` at import time and that binary is
+# absent on MUSA containers.
+_IS_MUSA = (
+    os.environ.get('DEEP_SELECT_BUILD_TARGET_PLATFORM') == 'MUSA'
+    or bool(glob.glob('/dev/mtgpu*'))
+    or bool(glob.glob('/dev/musa*'))
+)
+
+if _IS_MUSA:
+    class _KernelKitStub:
+        """Minimal stand-in for tests.kernelkit, which cannot be imported on MUSA."""
+
+        class Platform:
+            CUDA = 'CUDA'
+            ASCEND = 'ASCEND'
+
+        @staticmethod
+        def get_current_platform():
+            return 'MUSA'
+
+    kk = _KernelKitStub
+else:
+    import tests.kernelkit as kk
 
 exec(open("deep_select/__version__.py").read())
 
@@ -251,9 +275,28 @@ def build_on_ascend_platform():
 
     return (ext_modules, AscendBuildExtension)
 
+def build_on_musa_platform():
+    """MUSA ships no native kernel yet, so there is nothing to compile.
 
-build_target_platform = kk.get_current_platform()
+    ``deep_select_musa`` is a pure-Python module implementing the documented contract with
+    ``torch.topk``. Keeping the wheel buildable means ``pip install .`` succeeds on MUSA and callers
+    get a working ``deep_select`` instead of an "Unsupported platform" error.
+
+    The CUDA kernels cannot be reused here: all of them are TMA-based
+    (``cute/arch/copy_sm90_tma.hpp``), and MUSA's counterpart to TMA is TME. A native backend
+    therefore needs its own kernel; when one lands this function should return ext_modules built
+    with ``mcc`` the way ``build_on_cuda_platform`` uses ``nvcc``.
+    """
+    from torch.utils.cpp_extension import BuildExtension
+
+    print("MUSA: no native kernels to build; installing the torch.topk backend")
+    return ([], BuildExtension)
+
+
+
+
 overrided_platform = os.environ.get('DEEP_SELECT_BUILD_TARGET_PLATFORM', None)
+build_target_platform = 'MUSA' if _IS_MUSA else kk.get_current_platform()
 if overrided_platform is not None:
     overrided_platform_dict = {
         'CUDA': kk.Platform.CUDA,
@@ -272,9 +315,15 @@ except Exception:
     # a valid PEP 440 local version in that case.
     git_rev = "unknown"
 
-datetime_rev = datetime.now().strftime("%Y%m%d.%H%M%S")
+# NOTE: the version must be deterministic across the two times pip runs this file (metadata
+# generation and wheel build). A wall-clock stamp makes the two disagree and pip rejects the wheel
+# with "unexpected file name", so the build stamp is opt-in via DEEP_SELECT_BUILD_STAMP.
+datetime_rev = os.environ.get("DEEP_SELECT_BUILD_STAMP")
+local_version = f"{git_rev}.{datetime_rev}" if datetime_rev else git_rev
 
-if build_target_platform == kk.Platform.CUDA:
+if _IS_MUSA or build_target_platform == 'MUSA':
+    ext_modules, build_ext = build_on_musa_platform()
+elif build_target_platform == kk.Platform.CUDA:
     ext_modules, build_ext = build_on_cuda_platform()
 elif build_target_platform == kk.Platform.ASCEND:
     ext_modules, build_ext = build_on_ascend_platform()
@@ -284,7 +333,7 @@ else:
 
 setup(
     name="deep_select",
-    version=f"{__version__}+{git_rev}.{datetime_rev}",
+    version=f"{__version__}+{local_version}",
     packages=find_packages(include=['deep_select']),
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
