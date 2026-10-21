@@ -8,13 +8,22 @@ from typing import Optional, Tuple
 
 # Platform probe
 _IS_ASCEND = os.path.exists("/dev/davinci_manager")
+# MUSA keeps torch.cuda.is_available() False on purpose, so probe the version field
+# and the device nodes rather than the CUDA API.
+_IS_MUSA = (
+    hasattr(torch.version, "musa") and torch.version.musa is not None
+) or os.path.exists("/dev/mtgpu0")
 
 def _import_backend():
-    name = "deep_select_npu" if _IS_ASCEND else "deep_select_cuda"
+    if _IS_ASCEND:
+        name, target = "deep_select_npu", "ASCEND"
+    elif _IS_MUSA:
+        name, target = "deep_select_musa", "MUSA"
+    else:
+        name, target = "deep_select_cuda", "CUDA"
     try:
         return importlib.import_module(f".{name}", __package__)
     except ImportError as e:
-        target = "ASCEND" if _IS_ASCEND else "CUDA"
         raise ImportError(
             f"DeepSelect: failed to load the backend `{__package__}.{name}`. "
             f"Build it with DEEP_SELECT_BUILD_TARGET_PLATFORM={target}."
