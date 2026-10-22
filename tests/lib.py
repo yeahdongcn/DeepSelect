@@ -102,8 +102,20 @@ class UniformUIntDistribution(Distribution):
 
     def generate(self, result: torch.Tensor):
         uint_dtype = self.dtype2uint_dtype(result.dtype)
-        data = torch.randint(self.lower, self.upper, result.shape, dtype=torch.long).to(uint_dtype)
-        result.view(uint_dtype).copy_(data)
+        data = torch.randint(self.lower, self.upper, result.shape, dtype=torch.long)
+        if kk.is_on_musa_platform():
+            # MUSA's copy kernel rejects UINT32: `mtgpu_impl_copy_d2d MUDNN failed ...
+            # Unsupported unary mode: IDENTITY, or data type: UINT32`. Write the same bit
+            # patterns through the same-width *signed* view instead -- the bytes are
+            # identical, so the distribution is unchanged. This is a limitation of the MUSA
+            # copy path, not of the backend under test.
+            signed_dtype = {torch.uint16: torch.int16, torch.uint32: torch.int32}[uint_dtype]
+            bits = 16 if uint_dtype == torch.uint16 else 32
+            data = data & ((1 << bits) - 1)
+            data = torch.where(data >= (1 << (bits - 1)), data - (1 << bits), data).to(signed_dtype)
+            result.view(signed_dtype).copy_(data)
+        else:
+            result.view(uint_dtype).copy_(data.to(uint_dtype))
 
 
 class UintDistributionWithHotspotAndSpecifiedPivot(Distribution):
