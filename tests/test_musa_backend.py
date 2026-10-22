@@ -66,4 +66,60 @@ v7, i7 = run(x7, 16)
 print("7 topk>vocab: rows", v7.shape, "| head matches:", torch.equal(i7[:, :10].to(torch.int64), torch.argsort(x7, -1, descending=True)))
 ok &= torch.equal(i7[:, :10].to(torch.int64), torch.argsort(x7, -1, descending=True)) and bool((i7[:, 10:] == 2147483647).all())
 
+# 8. A *negative* fill value must still land in the padding, offset-free.
+#    Regression: "real entry" used to be `indices < vocab` (the row capacity) instead of
+#    `~padded`. DeepInfer passes idx_oob_fill_value=-1, and -1 < vocab, so padding was treated
+#    as real, offset by `ks`, and the row came back as `ks-1` in its tail: index 99 for ks=100.
+x8 = torch.randn(3, 64, dtype=torch.float32)
+end8 = torch.tensor([64, 5, 0], dtype=torch.int32)
+v8, i8 = run(x8, 8, end=end8, off=torch.tensor([100, 100, 100], dtype=torch.int32), fillidx=-1)
+tail8 = bool((i8[1, 5:] == -1).all())
+empty8 = bool((i8[2] == -1).all())
+print("8 negative fill: tail is -1 not ks-1:", tail8, "| empty row all -1:", empty8,
+      "| head offset:", i8[1, 0].item())
+ok &= tail8 and empty8 and int(i8[1, 0]) != 99
+
+# 9. Output order is the documented contract: valid entries first, padding last. With fill=-1 a
+#    plain ascending sort would put every padded entry *first*, so a caller that reads the first
+#    `min(end, topk)` columns as "selected" would see padding as selected.
+for si in (False, True):
+    v9, i9 = run(x8, 8, end=end8, off=torch.tensor([100, 100, 100], dtype=torch.int32),
+                 fillidx=-1, sorted_index=si)
+    real_first = bool((i9[1, :5] != -1).all()) and bool((i9[1, 5:] == -1).all())
+    print(f"9 sorted_index={si}: real entries first, padding last:", real_first)
+    ok &= real_first
+
+# 10. Values stay paired with their indices after the sorted_index permutation (the value fill
+#     mask used to be applied positionally *after* sorting, overwriting real values).
+v10, i10 = run(x8, 8, end=end8, off=torch.tensor([100, 100, 100], dtype=torch.int32),
+               fillidx=-1, sorted_index=True)
+pair_errs = []
+for r in range(3):
+    for c in range(8):
+        idx = int(i10[r, c])
+        is_pad = idx == -1
+        if is_pad != (float(v10[r, c]) == float("-inf")):
+            pair_errs.append((r, c))
+        elif not is_pad and float(v10[r, c]) != float(x8[r, idx - 100]):
+            pair_errs.append((r, c))
+print("10 value/index pairing errors:", pair_errs or "none")
+ok &= not pair_errs
+
+# 11. Long-context width: 16385 columns is the measured failing prompt length. Rows are kept
+#     small here (the full 8192-row chunk lives in tests/test_musa_longcontext.py) but the
+#     column count, which is what grows with context, is the real one.
+x11 = torch.randn(64, 16385, dtype=torch.float32)
+v11, i11 = run(x11, 512, end=torch.full((64,), 16385, dtype=torch.int32), off=torch.zeros(64, dtype=torch.int32),
+               fillidx=-1, sorted_index=True)
+rv11, ri11 = ref(x11, 512)
+# `sorted_index` permutes by index, so values are compared as a multiset and then checked
+# pairwise against the input at their own index.
+paired11 = torch.equal(torch.gather(x11, 1, i11.to(torch.int64)), v11)
+print("11 long-context: index set matches:", torch.equal(i11.to(torch.int64), torch.sort(ri11, -1).values),
+      "| value multiset matches:", torch.equal(torch.sort(v11, -1).values, torch.sort(rv11, -1).values),
+      "| value/index paired:", paired11)
+ok &= (torch.equal(i11.to(torch.int64), torch.sort(ri11, -1).values)
+       and torch.equal(torch.sort(v11, -1).values, torch.sort(rv11, -1).values)
+       and paired11)
+
 print("RESULT:", "ALL PASS" if ok else "FAILURES")
