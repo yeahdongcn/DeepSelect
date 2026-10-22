@@ -2,7 +2,7 @@ import os
 import contextlib
 import functools
 
-from .platform import Platform, requires_platform
+from .platform import Platform, is_on_musa_platform, requires_platform
 
 colors = {
     'RED_FG': '\033[31m',
@@ -46,6 +46,10 @@ def set_random_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    # `torch.cuda.is_available()` is False on MUSA by design, so the device seed has to be
+    # set through the MUSA namespace or a run is only host-deterministic.
+    if is_on_musa_platform() and hasattr(torch, "musa"):
+        torch.musa.manual_seed_all(seed)
 
 class Counter:
     def __init__(self):

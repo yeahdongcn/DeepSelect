@@ -8,7 +8,14 @@ import shutil
 import tempfile
 
 import torch
-import triton
+
+# Triton is only needed for the profiler-range marker kernel, and MUSA containers may not
+# ship it. Importing it unconditionally made `import kernelkit` fail before any test ran,
+# which took the whole suite with it.
+try:
+    import triton
+except ModuleNotFoundError:
+    triton = None
 
 from .platform import Platform, get_current_platform, requires_platform
 from .utils import is_using_profiling_tools, suppress_stdout_stderr
@@ -20,11 +27,17 @@ class empty_suppress:
     def __exit__(self, *_):
         pass
 
-@triton.jit
-def profiler_range_start_marker_kernel():
-    pass
+if triton is not None:
+    @triton.jit
+    def profiler_range_start_marker_kernel():
+        pass
 
 def _run_profiler_range_start_marker_kernel():
+    if triton is None:
+        raise RuntimeError(
+            "the profiler range marker kernel needs triton; it is unavailable on this "
+            "platform. Use the event-based path (`bench` on MUSA) instead of `_bench_kineto`."
+        )
     profiler_range_start_marker_kernel[(1,)]()
 
 @dataclasses.dataclass
@@ -243,6 +256,47 @@ def _bench_msprof(fn: Callable, num_tests: int = 30,
         shutil.rmtree(prof_dir, ignore_errors=True)
 
 
+def _bench_musa(fn: Callable, num_tests: int = 30,
+                flush_l2: bool = True) -> BenchResult:
+    """
+    Run `fn` for `num_tests` times, timed with `torch.musa.Event`.
+
+    There is no kineto/CUPTI event list for MUSA device kernels on this stack, so this
+    reports the wall time of one *call* of `fn` on the stream (launch + all of its kernels)
+    rather than per-kernel device time. For the `torch.topk` backend that is the honest
+    number: the op is one launch. It is not comparable to `_bench_kineto`'s per-kernel
+    figures, so the range is named after `fn` and reported as the op's time.
+
+    The first call of a MUSA op can pay a one-off JIT/allocator cost measured at ~2 s on
+    S5000, so one warmup call is run outside the timed region.
+    """
+    flush_l2_size = int(256e6 // 4)
+    flush_buf = torch.empty(flush_l2_size, dtype=torch.int32, device='musa')
+
+    fn()                    # warmup: JIT, allocator, kernel-module load
+    torch.musa.synchronize()
+
+    start_events = [torch.musa.Event(enable_timing=True) for _ in range(num_tests)]
+    end_events = [torch.musa.Event(enable_timing=True) for _ in range(num_tests)]
+    for i in range(num_tests):
+        if flush_l2:
+            flush_buf.random_()
+        start_events[i].record()
+        fn()
+        end_events[i].record()
+    torch.musa.synchronize()
+
+    # One range per run, in seconds, so `get_kernel_time` returns the mean call time.
+    ranges = []
+    elapsed_sum = 0.0
+    for i in range(num_tests):
+        elapsed = start_events[i].elapsed_time(end_events[i]) * 1e-3
+        ranges.append((elapsed_sum, elapsed_sum + elapsed))
+        elapsed_sum += elapsed
+
+    return BenchResult(num_tests, {getattr(fn, "__name__", "bench_fn"): ranges})
+
+
 def bench(fn: Callable, num_tests: int = 30,
           flush_l2: bool = True) -> BenchResult:
     current_platform = get_current_platform()
@@ -250,6 +304,8 @@ def bench(fn: Callable, num_tests: int = 30,
         return _bench_kineto(fn, num_tests, flush_l2)
     elif current_platform == Platform.ASCEND:
         return _bench_msprof(fn, num_tests, flush_l2)
+    elif current_platform == Platform.MUSA:
+        return _bench_musa(fn, num_tests, flush_l2)
     else:
         raise RuntimeError(f"Unknown platform: {current_platform}")
 
@@ -260,40 +316,48 @@ def bench_by_cuda_events(kernels: List[Callable], num_warmups_each: int, num_run
 @overload
 def bench_by_cuda_events(kernels: Callable, num_warmups_each: int, num_runs_each: int) -> float: ...
 
-@requires_platform(Platform.CUDA)
+def _timing_backend():
+    """(device type, event class, sync fn, nvtx module) for the current platform."""
+    if get_current_platform() == Platform.MUSA:
+        return 'musa', torch.musa.Event, torch.musa.synchronize, getattr(torch.musa, "nvtx", None)
+    return 'cuda', torch.cuda.Event, torch.cuda.synchronize, torch.cuda.nvtx
+
+
+@requires_platform([Platform.CUDA, Platform.MUSA])
 def bench_by_cuda_events(kernels: Union[List[Callable], Callable], num_warmups_each: int = 10, num_runs_each: int = 30) -> Union[List[float], float]:
-    buf_for_l2_clear = torch.empty(int(256e6//4), dtype=torch.int32, device='cuda')
+    device_type, Event, sync, nvtx = _timing_backend()
+    buf_for_l2_clear = torch.empty(int(256e6//4), dtype=torch.int32, device=device_type)
 
     is_kernel_single_callable = isinstance(kernels, Callable)
     if is_kernel_single_callable:
         kernels = [kernels]
 
-    torch.cuda.synchronize()
+    sync()
     for i in range(num_warmups_each):
         for kernel in kernels:
             kernel()
             if i == 0:
                 # Ensure the first run is successful
                 try:
-                    torch.cuda.synchronize()
+                    sync()
                 except Exception as e:
                     print(f"Kernel {kernel.__name__} failed on warmup run {i}: {e}")
                     return []
 
-    start_events = [[torch.cuda.Event(enable_timing=True) for _ in range(num_runs_each)] for _ in kernels]
-    end_events = [[torch.cuda.Event(enable_timing=True) for _ in range(num_runs_each)] for _ in kernels]
+    start_events = [[Event(enable_timing=True) for _ in range(num_runs_each)] for _ in kernels]
+    end_events = [[Event(enable_timing=True) for _ in range(num_runs_each)] for _ in kernels]
     for i in range(num_runs_each):
         for j, kernel in enumerate(kernels):
             buf_for_l2_clear.random_()
-            if i == num_runs_each-1:
-                torch.cuda.nvtx.range_push("profile_target")
+            if i == num_runs_each-1 and nvtx is not None:
+                nvtx.range_push("profile_target")
             start_events[j][i].record()
             kernel()
             end_events[j][i].record()
-            if i == num_runs_each-1:
-                torch.cuda.nvtx.range_pop()
+            if i == num_runs_each-1 and nvtx is not None:
+                nvtx.range_pop()
     
-    torch.cuda.synchronize()
+    sync()
     time_usages = [
         sum([start_events[j][i].elapsed_time(end_events[j][i])*1e-3 for i in range(num_runs_each)]) / num_runs_each
         for j in range(len(kernels))

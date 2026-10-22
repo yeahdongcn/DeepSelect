@@ -1,5 +1,6 @@
 import enum
 import functools
+import glob
 import subprocess
 import os
 
@@ -7,17 +8,28 @@ import os
 class Platform(enum.Enum):
     CUDA = "CUDA"
     ASCEND = "ASCEND"
+    MUSA = "MUSA"
     CPU_ONLY = "CPU_ONLY"
 
 
 @functools.lru_cache(maxsize=1)
 def get_current_platform() -> Platform:
     """
-    Get the current platform via `lspci`
+    Get the current platform via device nodes and `lspci`
     """
     if os.path.exists("/dev/davinci_manager"):
         return Platform.ASCEND
-    output = subprocess.check_output(["lspci"], text=True)
+    # MUSA keeps `torch.cuda.is_available()` False on purpose, so the device node is the
+    # probe -- the same one `setup.py` and `deep_select/interface.py` use. On S5000 the node
+    # is `/dev/mtgpu.0` (with a dot), so this has to be a glob.
+    if glob.glob("/dev/mtgpu*") or glob.glob("/dev/musa*"):
+        return Platform.MUSA
+    # `lspci` is absent from MUSA containers, and this module is imported by every test on
+    # every platform, so a missing binary must not abort the suite.
+    try:
+        output = subprocess.check_output(["lspci"], text=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return Platform.CPU_ONLY
     if "3D controller: NVIDIA Corporation Device" in output:
         return Platform.CUDA
     return Platform.CPU_ONLY
@@ -67,6 +79,10 @@ def is_on_cuda_platform() -> bool:
 
 def is_on_ascend_platform() -> bool:
     return get_current_platform() == Platform.ASCEND
+
+
+def is_on_musa_platform() -> bool:
+    return get_current_platform() == Platform.MUSA
 
 
 def is_on_cpu_only_platform() -> bool:

@@ -16,8 +16,20 @@ import lib
 from lib import TestParam, Testcase, UniformUIntDistribution, NormalFloatDistribution, UintDistributionWithHotspotAndSpecifiedPivot, get_fp_config
 
 IS_ASCEND = kk.get_current_platform() == kk.Platform.ASCEND
+IS_MUSA = kk.get_current_platform() == kk.Platform.MUSA
 
-MAX_VOCAB_SIZE = (2 * 1024 * 1024 - 1) if IS_ASCEND else ((1 << 23) - 1)
+# The MUSA backend is the `torch.topk` reference path, and unlike the CUDA kernel it materialises
+# (batch, vocab) temporaries: the NaN check builds two boolean masks and a masked copy of the row,
+# and the padding path copies the row again. At the suite's largest row (batch 1024 x 8388607) one
+# fp32 buffer is ~34 GiB, so the peak is >100 GiB and the cap is **memory, not capability** -- every
+# case at or below it runs. Raise it with `--max-vocab` on a bigger card.
+MUSA_MAX_VOCAB_SIZE = 1 << 20
+
+MAX_VOCAB_SIZE = (
+    (2 * 1024 * 1024 - 1) if IS_ASCEND
+    else MUSA_MAX_VOCAB_SIZE if IS_MUSA
+    else ((1 << 23) - 1)
+)
 
 def get_space(t: torch.Tensor):
     return t.numel() * t.element_size()
@@ -172,7 +184,7 @@ def run_testcase(p: TestParam, quiet: bool = False, t: Optional[Testcase] = None
     return is_correct
 
 if __name__ == '__main__':
-    torch.set_default_device("npu" if kk.get_current_platform() == kk.Platform.ASCEND else "cuda")
+    torch.set_default_device("npu" if IS_ASCEND else "musa" if IS_MUSA else "cuda")
 
     parser = argparse.ArgumentParser()
     lib.stick_unit_test_args(parser)
@@ -180,7 +192,19 @@ if __name__ == '__main__':
                         help="Only run testcases whose input dtype matches")
     parser.add_argument("--perf-only", action="store_true",
                         help="Only run performance testcases (num_runs > 0)")
+    # The full matrix is ~116k correctness cases, which is sized for a native kernel. A
+    # reference backend needs a representative slice, so the sampler below is deterministic:
+    # take every `--case-stride`-th case, then stop after `--case-limit`.
+    parser.add_argument("--case-stride", type=int, default=1,
+                        help="Keep every N-th testcase (deterministic, covers the whole matrix)")
+    parser.add_argument("--case-limit", type=int, default=0,
+                        help="Stop after N testcases (0 = no limit)")
+    parser.add_argument("--max-vocab", type=int, default=None,
+                        help="Skip testcases wider than this (default: the platform cap)")
     args = parser.parse_args()
+    # `--max-vocab` can only be used to go *below* the platform cap here, because the cap is
+    # what keeps a reference backend inside device memory (see MUSA_MAX_VOCAB_SIZE).
+    max_vocab_for_generation = min(args.max_vocab, MAX_VOCAB_SIZE) if args.max_vocab is not None else MAX_VOCAB_SIZE
 
     valid_sv_si_rv_combinations = [ # sv_si_rv: sorted_value, sorted_index, return_value
         (False, False, False),
@@ -203,8 +227,8 @@ if __name__ == '__main__':
                     ]:
                         if b == 4096 and vocab_size > 1048576:
                             continue    # To avoid OOM
-                        if vocab_size > MAX_VOCAB_SIZE:
-                            continue    # `vocab_size` exceeds what the backend supports (see MAX_VOCAB_SIZE)
+                        if vocab_size > max_vocab_for_generation:
+                            continue    # `vocab_size` exceeds what this platform can size in memory
                         for topk in [
                             1, random.randint(2, 500), 512, 1024, 1231, 2048, 2132, 2333, 4096
                         ]:
@@ -260,6 +284,12 @@ if __name__ == '__main__':
         testcases = [t for t in testcases if t.dtype == wanted_dtype]
     if args.perf_only:
         testcases = [t for t in testcases if t.num_runs > 0]
+    if args.max_vocab is not None:
+        testcases = [t for t in testcases if t.vocab_size <= args.max_vocab]
+    if args.case_stride > 1:
+        testcases = testcases[::args.case_stride]
+    if args.case_limit > 0:
+        testcases = testcases[:args.case_limit]
 
     # Drop the testcases the current platform's backend cannot run
     testcases = [t for t in testcases if t.can_run_on_and_clamp()]

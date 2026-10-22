@@ -2,7 +2,7 @@ from typing import overload, Literal, List, Union
 
 import torch
 
-from .platform import is_on_ascend_platform
+from .platform import is_on_ascend_platform, is_on_musa_platform
 
 def check_is_bitwise_equal_comparator(ans: torch.Tensor, ref: torch.Tensor, result: torch.Tensor):
     """
@@ -28,8 +28,9 @@ def get_cos_diff(ans: torch.Tensor, ref: torch.Tensor, dtype: torch.dtype = torc
     """
     Calculate the cosine diff between two tensors
     """
-    if is_on_ascend_platform() and dtype == torch.double:
-        # Ascend NPU doesn't support float64
+    if (is_on_ascend_platform() or is_on_musa_platform()) and dtype == torch.double:
+        # Neither Ascend NPU nor MUSA supports device float64, so the comparison is done
+        # on the host.
         ans = ans.cpu()
         ref = ref.cpu()
     ans, ref = ans.to(dtype), ref.to(dtype)

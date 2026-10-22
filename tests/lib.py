@@ -218,6 +218,11 @@ class TestParam:
             if self.sorted_value:
                 return False
             return True
+        elif kk.is_on_musa_platform():
+            # The MUSA backend is the torch.topk reference path, so it supports every dtype,
+            # index dtype and flag combination the suite generates. What bounds it is memory,
+            # not capability: see `MUSA_MAX_VOCAB_SIZE` in test.py.
+            return True
         else:
             raise RuntimeError("Unknown platform")
 
