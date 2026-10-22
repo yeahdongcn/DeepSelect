@@ -106,28 +106,44 @@ def topk(
     # its 5 real indices and fills the other 3, and a topk larger than the vocabulary
     # keeps the real head instead of blanking the row.
     padded = indices >= lengths[:, None]
-    if bool(padded.any()):
+    has_padding = bool(padded.any())
+    if has_padding:
         fill_idx = torch.full_like(indices, int(idx_oob_fill_value))
         indices = torch.where(padded, fill_idx, indices)
         if return_value and output_val is not None:
             fill_val = torch.full_like(values, value_oob_fill_value)
             values = torch.where(padded, fill_val, values)
 
-    in_place = indices < vocab
+    # "Real entry" is the complement of `padded`, not `indices < vocab`. The latter is the
+    # row *capacity*, and the fill value can be smaller than it: DeepInfer passes
+    # `idx_oob_fill_value=-1`, so `-1 < vocab` is true and every padded entry would be
+    # offset to `output_idx_offset - 1` -- a valid-looking key index instead of the -1 the
+    # caller tests for. Keep the predicate that was actually measured.
+    in_place = ~padded
     if output_idx_offset is not None:
         offset = output_idx_offset.to(torch.long)[:, None]
         shifted = indices + offset
         # Padding must stay at the fill value, never offset.
         indices = torch.where(in_place, shifted, indices)
 
+    # Output order is part of the contract, and it is not the fill value's numeric order:
+    # "valid elements will be gathered at the beginning of values and indices", the rest
+    # filled. `sorted_index` sorts that real block ascending. The fill value is chosen by
+    # the caller (-1 for DeepInfer, 2147483647 by default), so with -1 a plain ascending
+    # sort would put every padded entry *first*; the real block is therefore pinned first
+    # by a stable partition, and `values` follows the same permutation so every value stays
+    # paired with its index.
+    perm = None
     if sorted_index and k > 1:
-        order = torch.argsort(indices.to(torch.int64), dim=-1, stable=True)
-        indices = torch.sort(indices.to(torch.int64), dim=-1, stable=True).values
+        perm = torch.argsort(indices.to(torch.int64), dim=-1, stable=True)
+    if has_padding:
+        padded_sorted = torch.gather(padded.to(torch.int64), -1, perm) if perm is not None else padded.to(torch.int64)
+        partition = torch.argsort(padded_sorted, dim=-1, stable=True)
+        perm = partition if perm is None else torch.gather(perm, -1, partition)
+    if perm is not None:
+        indices = torch.gather(indices, -1, perm)
         if return_value and output_val is not None:
-            was_fallback = ~in_place
-            rebuilt = _gather_keep_order(values, order)
-            # Keep the fill value on rows that were padded, whatever the sort did.
-            values = torch.where(was_fallback, torch.full_like(values, value_oob_fill_value), rebuilt)
+            values = _gather_keep_order(values, perm)
 
     if abort_when_nan_found and input.numel() > 0 and bool(bad_rows.any()):
         keep = ~bad_rows
