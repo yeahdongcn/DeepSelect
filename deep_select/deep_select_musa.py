@@ -73,19 +73,27 @@ def topk(
     else:
         lengths = end.to(torch.long).clamp(min=0, max=vocab)
 
-    # NaN policy: the documented behaviour is to poison the row rather than return
-    # a plausible-looking wrong index. Surfacing a corrupt row is the point.
-    if abort_when_nan_found and input.numel() > 0:
+    # NaN policy, as documented in `interface.topk`: "The NaN check itself is always
+    # enabled"; `abort_when_nan_found` only chooses between aborting the kernel and writing
+    # the `0x3F3F3F3F` marker, so the marker is written either way. The suite calls this
+    # function with `abort_when_nan_found=False` and still asserts the marker, which is how
+    # the earlier gate on the flag was caught.
+    bad_rows = None
+    if input.numel() > 0:
         in_range = torch.arange(vocab, device=device)[None, :] < lengths[:, None]
         bad_rows = torch.isnan(input).logical_and(in_range).any(dim=-1)
         if bool(bad_rows.any()):
-            # Only the offending rows are poisoned; a clean row in the same batch must
-            # still return a usable answer.
-            output_idx[bad_rows] = 0x3F3F3F3F
-            if return_value and output_val is not None:
-                output_val[bad_rows] = value_oob_fill_value
-            if bool(bad_rows.all()):
-                return
+            # CUDA parity: only `output_idx[row][0]` carries the marker. When the caller asked
+            # to abort, poison the whole offending row as well and stop before doing work for
+            # a batch that cannot be trusted -- the clean rows of a mixed batch still return a
+            # usable answer, which is what the previous behaviour and its test assert.
+            output_idx[bad_rows, 0] = 0x3F3F3F3F
+            if abort_when_nan_found:
+                output_idx[bad_rows] = 0x3F3F3F3F
+                if return_value and output_val is not None:
+                    output_val[bad_rows] = value_oob_fill_value
+                if bool(bad_rows.all()):
+                    return
 
     k = int(topk)
     width = max(k, vocab)
@@ -101,6 +109,26 @@ def topk(
         work = work.masked_fill(~valid, float("-inf"))
 
     values, indices = torch.topk(work, k, dim=-1, largest=True, sorted=True)
+
+    # torch_musa's bf16 `topk` returns *duplicate indices* when values tie: measured on S5000
+    # at (18, 262144, k=2132) with a bf16 `randn` (bf16 has 8 mantissa bits, so ties are
+    # common) it gave 967 duplicate index slots in a 2132-wide row, 17451 across 18 rows,
+    # while the *same* call on CPU gives 0. fp32 is clean (0 duplicate slots). The backend
+    # inherits that, and `tests/test.py` catches it as "unique index". Detect it once (a
+    # sorted pass over k, which the `sorted_index` path needs anyway) and re-derive only the
+    # affected rows with an argsort of the whole row: argsort returns a permutation by
+    # construction, so it cannot duplicate, and with ties any tie member is a valid answer.
+    if k > 1:
+        ordered = torch.sort(indices, dim=-1).values
+        dup_rows = (ordered[:, 1:] == ordered[:, :-1]).any(dim=-1)
+        if bool(dup_rows.any()):
+            bad = torch.nonzero(dup_rows, as_tuple=False).flatten()
+            fixed = torch.argsort(work[bad], dim=-1, descending=True, stable=True)[:, :k]
+            indices = indices.clone()
+            indices[bad] = fixed
+            if return_value and output_val is not None:
+                values = values.clone()
+                values[bad] = torch.gather(work[bad], 1, fixed)
 
     # Padding is identified per entry, not per row: a row with length 5 and topk 8 keeps
     # its 5 real indices and fills the other 3, and a topk larger than the vocabulary
@@ -145,7 +173,7 @@ def topk(
         if return_value and output_val is not None:
             values = _gather_keep_order(values, perm)
 
-    if abort_when_nan_found and input.numel() > 0 and bool(bad_rows.any()):
+    if abort_when_nan_found and bad_rows is not None and bool(bad_rows.any()):
         keep = ~bad_rows
         output_idx[keep] = indices.to(output_idx.dtype)[keep]
         if return_value and output_val is not None:
@@ -155,3 +183,7 @@ def topk(
     output_idx.copy_(indices.to(output_idx.dtype))
     if return_value and output_val is not None:
         output_val.copy_(values.to(output_val.dtype))
+    if bad_rows is not None and bool(bad_rows.any()):
+        # The copy above overwrites the marker; the check is unconditional, so restore it for
+        # the rows that carried a NaN. Only column 0 carries it, matching CUDA.
+        output_idx[bad_rows, 0] = 0x3F3F3F3F

@@ -122,4 +122,17 @@ ok &= (torch.equal(i11.to(torch.int64), torch.sort(ri11, -1).values)
        and torch.equal(torch.sort(v11, -1).values, torch.sort(rv11, -1).values)
        and paired11)
 
+# 12. The NaN check is always on: `abort_when_nan_found=False` still writes the marker at
+#     column 0 (CUDA parity), and a NaN past `end` must not mark the row.
+xn2 = torch.randn(2, 32, dtype=torch.float32); xn2[0, 3] = float("nan")
+oi12 = torch.zeros((2, 4), dtype=torch.int32); ov12 = torch.zeros((2, 4), dtype=torch.float32)
+mtopk(xn2, 4, None, None, True, False, ov12, oi12, None, -7, float("-inf"), True, False)
+mark_no_abort = int(oi12[0, 0]) == 0x3F3F3F3F and bool((oi12[1] != 0x3F3F3F3F).all())
+xn3 = torch.randn(1, 8, dtype=torch.float32); xn3[0, 7] = float("nan")
+oi13 = torch.zeros((1, 4), dtype=torch.int32); ov13 = torch.zeros((1, 4), dtype=torch.float32)
+mtopk(xn3, 4, None, torch.tensor([4], dtype=torch.int32), True, False, ov13, oi13, None, -7, float("-inf"), True, False)
+outside_end = bool((oi13 != 0x3F3F3F3F).all())
+print("12 NaN marker without abort:", mark_no_abort, "| NaN past end not marked:", outside_end)
+ok &= mark_no_abort and outside_end
+
 print("RESULT:", "ALL PASS" if ok else "FAILURES")
